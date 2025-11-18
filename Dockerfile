@@ -40,4 +40,4 @@ EXPOSE 8080
 # -----------------------
 # Run the Flask app
 # -----------------------
-CMD ["python", "main.py"]
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "main:app", "--workers=1", "--threads=4"]
