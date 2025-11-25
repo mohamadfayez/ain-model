@@ -1,43 +1,31 @@
-# Use lightweight official Python image
+# Use Python 3.11 slim image
 FROM python:3.11-slim
 
-# -----------------------
-# Environment variables
-# -----------------------
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PORT=8080
-
-# -----------------------
-# Install system dependencies
-# -----------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# -----------------------
 # Set working directory
-# -----------------------
 WORKDIR /app
 
-# -----------------------
-# Copy all application files
-# -----------------------
-COPY . .
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-# -----------------------
+# Copy requirements
+COPY requirements.txt .
+
 # Install Python dependencies
-# -----------------------
 RUN pip install --no-cache-dir -r requirements.txt
 
-# -----------------------
-# Expose Cloud Run port
-# -----------------------
+# Copy application
+COPY app.py .
+
+# Expose port
 EXPOSE 8080
 
-# -----------------------
-# Run the Flask app
-# -----------------------
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "main:app", "--workers=1", "--threads=4"]
+# Set environment variables
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+
+# Run the application
+CMD exec uvicorn app:app --host 0.0.0.0 --port ${PORT}
