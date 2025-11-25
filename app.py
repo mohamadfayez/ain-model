@@ -1,15 +1,13 @@
-"""
+cc"""
 FastAPI Server for AIN Model on Cloud Run
-Complete working version ready for deployment
+Fixed version with proper startup handling
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
-import torch
 import logging
+import os
 from typing import List, Dict, Any
 
 # Setup logging
@@ -31,6 +29,7 @@ app.add_middleware(
 # Global model and processor
 model = None
 processor = None
+model_loading = False
 
 # Request model
 class InferRequest(BaseModel):
@@ -43,13 +42,22 @@ class InferResponse(BaseModel):
     status: str = "success"
 
 
-@app.on_event("startup")
-async def load_model():
-    """Load model on startup"""
-    global model, processor
+def load_model_sync():
+    """Load model synchronously"""
+    global model, processor, model_loading
+    
+    if model is not None:
+        return
+    
+    if model_loading:
+        return
     
     try:
+        model_loading = True
         logger.info("Loading AIN model...")
+        
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        import torch
         
         # Load model
         model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -62,21 +70,26 @@ async def load_model():
         processor = AutoProcessor.from_pretrained("MBZUAI/AIN")
         
         logger.info("Model loaded successfully!")
+        model_loading = False
         
     except Exception as e:
         logger.error(f"Error loading model: {e}")
+        model_loading = False
         raise
 
 
 @app.get("/")
 async def root():
-    """Health check endpoint"""
+    """Health check endpoint - responds immediately"""
     return {
         "status": "running",
         "model": "AIN-7B",
+        "model_loaded": model is not None,
+        "model_loading": model_loading,
         "endpoints": {
             "infer": "/infer (POST)",
-            "health": "/health (GET)"
+            "health": "/health (GET)",
+            "load": "/load (POST)"
         }
     }
 
@@ -84,12 +97,28 @@ async def root():
 @app.get("/health")
 async def health():
     """Detailed health check"""
+    import torch
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "processor_loaded": processor is not None,
-        "device": str(next(model.parameters()).device) if model else "unknown"
+        "model_loading": model_loading,
+        "device": str(next(model.parameters()).device) if model else "unknown",
+        "cuda_available": torch.cuda.is_available()
     }
+
+
+@app.post("/load")
+async def load():
+    """Manually trigger model loading"""
+    if model is not None:
+        return {"status": "already_loaded"}
+    
+    try:
+        load_model_sync()
+        return {"status": "loaded"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/infer", response_model=InferResponse)
@@ -113,10 +142,25 @@ async def infer(request: InferRequest):
     """
     global model, processor
     
+    # Load model on first request if not loaded
+    if model is None and not model_loading:
+        logger.info("Model not loaded, loading on first request...")
+        load_model_sync()
+    
+    # Wait if model is loading
+    import time
+    wait_time = 0
+    while model_loading and wait_time < 300:  # Wait max 5 minutes
+        time.sleep(1)
+        wait_time += 1
+    
     if model is None or processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
+        from qwen_vl_utils import process_vision_info
+        import torch
+        
         messages = request.messages
         
         # Apply chat template
@@ -172,4 +216,49 @@ async def infer(request: InferRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+# Use Python 3.11 slim image
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (for better caching)
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8080
+
+# Set environment variables
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+ENV TRANSFORMERS_CACHE=/app/.cache
+ENV HF_HOME=/app/.cache
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+# Run the application
+CMD exec uvicorn app:app --host 0.0.0.0 --port ${PORT} --timeout-keep-alive 300
